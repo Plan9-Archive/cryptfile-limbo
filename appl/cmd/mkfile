@@ -1,0 +1,19 @@
+<../../mkconfig
+
+TARG=\
+	cryptfile.dis\
+	pbkdf2.dis\
+	testpbkdf2.dis\
+
+SYSMODULES=\
+	arg.m\
+	bufio.m\
+	daytime.m\
+	draw.m\
+	keyring.m\
+	string.m\
+	sys.m\
+
+DISBIN=$ROOT/dis
+
+<$ROOT/mkfiles/mkdis
