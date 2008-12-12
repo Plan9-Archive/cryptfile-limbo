@@ -1,42 +1,41 @@
 implement Cryptfile;
 
 include "sys.m";
+	sys: Sys;
+	sprint: import sys;
 include "draw.m";
 include "arg.m";
 include "bufio.m";
 	bufio: Bufio;
 	Iobuf: import bufio;
 include "string.m";
+	str: String;
 include "daytime.m";
+	daytime: Daytime;
 include "styx.m";
+	styx: Styx;
 	Tmsg, Rmsg: import Styx;
+	Styxserver, Fid, Navigator, Navop: import styxservers;
 include "styxservers.m";
+	styxservers: Styxservers;
 include "keyring.m";
-
-sys: Sys;
-str: String;
-daytime: Daytime;
-styx: Styx;
-styxservers: Styxservers;
-keyring: Keyring;
-
-sprint: import sys;
-Styxserver, Fid, Navigator, Navop: import styxservers;
+	kr: Keyring;
 
 Dflag, dflag: int;
 
 Sectorsize:	con 512;
+Bsize:	con kr->AESbsize;
 filesize:	big;
 filefd:	ref Sys->FD;
-cryptkey:	array of byte;
 starttime:	int;
+keystate:	ref kr->AESstate;
 
 
 Qroot, Qdata: con iota;
 tab := array[] of {
 	(Qroot,		".",	Sys->DMDIR|8r555),
 	(Qdata,		"data",	8r666),
-	# xxx also implement a ctl file to forget and give a password.  and a file that that raises needs for a key.
+	# xxx also implement a ctl file to clear & forget the keystate.
 };
 Qfirst:	con Qdata;
 Qlast:	con Qdata;
@@ -58,7 +57,7 @@ init(nil: ref Draw->Context, args: list of string)
 	styx->init();
 	styxservers = load Styxservers Styxservers->PATH;
 	styxservers->init(styx);
-	keyring = load Keyring Keyring->PATH;
+	kr = load Keyring Keyring->PATH;
 
 	sys->pctl(Sys->NEWPGRP, nil);
 
@@ -83,10 +82,11 @@ init(nil: ref Draw->Context, args: list of string)
 	msgc: chan of ref Tmsg;
 	(msgc, srv) = Styxserver.new(sys->fildes(0), nav, big Qroot);
 
-
-	# xxx get proper key somewhere
-	cryptkey = array of byte "Ais5ahjei2uzeyoo";
+	# xxx get proper key somewhere (factotum)
+	cryptkey := array of byte "Ais5ahjei2uzeyoo";
 	say(sprint("len cryptkey=%d", len cryptkey));
+	keystate = kr->aessetup(cryptkey, nil);
+	zero(cryptkey);
 
 	filefd = sys->open(file, sys->ORDWR);
 	if(filefd == nil)
@@ -111,58 +111,114 @@ done:
 	}
 }
 
-
-cbc(key: array of byte, offset: big, buf: array of byte, direction: int)
+bufincr(d: array of byte)
 {
-	say(sprint("aes offset=%bd len buf=%d", offset, len buf));
-	n := len buf / Sectorsize;
-	ivec := array[len key] of byte;
-	for(i := 0; i < n; i++) {
-		for(j := 0; j < len ivec; j++)
-			ivec[j] = byte 0;
-		j = 0;
-		for(index := offset / big Sectorsize + big i; index > big 0; index >>= 8)
-			ivec[j++] = byte (index & big 16rff);
-		state := keyring->aessetup(key, ivec);
-		keyring->aescbc(state, ivec, len ivec, keyring->Encrypt);
-		state = keyring->aessetup(key, ivec);
-		keyring->aescbc(state, buf[i*Sectorsize:], Sectorsize, direction);
+	for(i := len d-1; i >= 0; i--)
+		if(++d[i] != byte 0)
+			return;
+}
+
+bufxor(dst, buf: array of byte, n: int)
+{
+	for(i := 0; i < n; i++)
+		dst[i] ^= buf[i];
+}
+
+cbcsector(st: ref kr->AESstate, ivec: array of byte, buf: array of byte, direction: int)
+{
+	if(direction == kr->Encrypt) {
+		#say(sprint("cbc encrypt, ivec %s, len buf %d", hex(ivec), len buf));
+		bufxor(buf, ivec, len ivec);
+		kr->aesecb(st, buf, Bsize, kr->Encrypt);
+		for(o := Bsize; o < Sectorsize; o += Bsize) {
+			bufxor(buf[o:], buf[o-Bsize:], Bsize);
+			kr->aesecb(st, buf[o:], Bsize, kr->Encrypt);
+			#say(sprint("cbc encrypt, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
+		}
+	} else {
+		#say(sprint("cbc decrypt, ivec %s, len buf %d", hex(ivec), len buf));
+		for(o := Sectorsize-Bsize; o > 0; o -= Bsize) {
+			#say(sprint("cbc encrypt, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
+			kr->aesecb(st, buf[o:], Bsize, kr->Decrypt);
+			bufxor(buf[o:], buf[o-Bsize:], Bsize);
+			#say(sprint("cbc encrypt, o %d, plain %s", o, hex(buf[o:o+Bsize])));
+		}
+		#say(sprint("cbc encrypt last, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
+		kr->aesecb(st, buf[o:], Bsize, kr->Decrypt);
+		bufxor(buf[o:], ivec, len ivec);
+		#say(sprint("cbc encrypt last, o %d, plain %s", o, hex(buf[o:o+Bsize])));
 	}
 }
 
-dowrite(buf: array of byte, offset: big): string
+crypt(off: big, buf: array of byte, direction: int)
 {
-		say(sprint("write received, offset=%bd len=%d", offset, len buf));
-		if(offset % big Sectorsize != big 0 || len buf % Sectorsize != 0)
-			return "write not aligned";
+	#say(sprint("aes ecb off=%bd n=%d", off, len buf));
 
-		if(offset+big len buf > filesize)
-			return "write outside file boundaries";
+	n := len buf/Sectorsize;
+	ctr := array[Bsize] of {* => byte 0};
+	p64(ctr, off/big Sectorsize);
+	for(i := 0; i < n; i++) {
+		#say(sprint("crypt, sector %bd, ctr %s", (off/big Sectorsize)+big i, hex(ctr)));
 
-		cbc(cryptkey, offset, buf, keyring->Encrypt);
-		n := sys->pwrite(filefd, buf, len buf, big offset);
-		if(n < len buf)
-			return sprint("writing to file: %r");
-		return nil;
+		# encrypt the sector number to get an ivec
+		xor := array[len ctr] of byte;
+		xor[:] = ctr;
+		kr->aesecb(keystate, xor, len xor, kr->Encrypt);
+
+		# then cbc the data with the ivec
+		cbcsector(keystate, xor, buf, direction);
+
+		# and prepare for the next
+		bufincr(ctr);
+		buf = buf[Sectorsize:];
+	}
 }
 
-doread(count: int, offset: big): (array of byte, string)
+aligned(off: big, n: int): string
 {
-		say(sprint("read received, offset=%bd count=%d", offset, count));
-		if(offset % big Sectorsize != big 0 || count % Sectorsize != 0)
-			return (nil, "read not aligned");
+	if(off % big Sectorsize != big 0 || n % Sectorsize != 0)
+		return "not aligned";
 
-		if(big offset > filesize)
-			return (nil, "offset lies outside file");
+	if(off > filesize)
+		return "beyong file end";
+	return nil;
+}
 
-		buf := array[count] of byte;
-		n := sys->pread(filefd, buf, len buf, big offset);
-		if(n < 0)
-			return (nil, sprint("reading from file: %r"));
-		n &= ~(Sectorsize-1);
-		buf = buf[:n];
-		cbc(cryptkey, offset, buf, keyring->Decrypt);
-		return (buf, nil);
+dowrite(buf: array of byte, off: big): string
+{
+	say(sprint("write, off=%bd len=%d", off, len buf));
+
+	err := aligned(off, len buf);
+	if(err != nil)
+		return "write: "+err;
+
+	if(off+big len buf > filesize)
+		return "write outside file boundaries";
+
+	crypt(off, buf, kr->Encrypt);
+	n := sys->pwrite(filefd, buf, len buf, off);
+	if(n < len buf)
+		return sprint("write: %r");
+	return nil;
+}
+
+doread(n: int, off: big): (array of byte, string)
+{
+	say(sprint("read, off=%bd n=%d", off, n));
+
+	err := aligned(off, n);
+	if(err != nil)
+		return (nil, "read: "+err);
+
+	buf := array[n] of byte;
+	nn := preadn(filefd, buf, len buf, big off);
+	if(nn < 0)
+		return (nil, sprint("read: %r"));
+	if(nn % Sectorsize != 0)
+		return (nil, "partial read misaligned");
+	buf = buf[:nn];
+	crypt(off, buf, kr->Decrypt);
+	return (buf, nil);
 }
 
 dostyx(gm: ref Tmsg)
@@ -216,8 +272,6 @@ dostyx(gm: ref Tmsg)
 		* =>
 			srv.default(m);
 		}
-
-		# xxx make sure read is on proper boundaries, and do read
 
 	Wstat =>
 		f := srv.getfid(m.fid);
@@ -310,6 +364,49 @@ dir(path, mtime: int): ref Sys->Dir
 replyerror(m: ref Tmsg, s: string)
 {
 	srv.reply(ref Rmsg.Error(m.tag, s));
+}
+
+preadn(fd: ref Sys->FD, buf: array of byte, n: int, off: big): int
+{
+	t := 0;
+	while(n > 0) {
+		nn := sys->pread(fd, buf[t:], n, off);
+		if(nn < 0)
+			return nn;
+		if(nn == 0)
+			break;
+		n -= nn;
+		off += big nn;
+		t += nn;
+	}
+	return t;
+}
+
+hex(d: array of byte): string
+{
+	s := "";
+	for(i := 0; i < len d; i++)
+		s += sprint("%02x", int d[i]);
+	return s;
+}
+
+p64(d: array of byte, v: big)
+{
+	d = d[len d-8:];
+	o := 0;
+	d[o++] = byte (v>>56);
+	d[o++] = byte (v>>48);
+	d[o++] = byte (v>>40);
+	d[o++] = byte (v>>32);
+	d[o++] = byte (v>>24);
+	d[o++] = byte (v>>16);
+	d[o++] = byte (v>>8);
+	d[o++] = byte (v>>0);
+}
+
+zero(d: array of byte)
+{
+	d[:] = array[len d] of {* => byte '0'};
 }
 
 kill(pid: int)
