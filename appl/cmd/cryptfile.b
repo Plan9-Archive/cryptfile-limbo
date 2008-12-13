@@ -20,6 +20,8 @@ include "styxservers.m";
 	styxservers: Styxservers;
 include "keyring.m";
 	kr: Keyring;
+include "factotum.m";
+	fact: Factotum;
 
 Dflag, dflag: int;
 
@@ -31,13 +33,13 @@ starttime:	int;
 keystate:	ref kr->AESstate;
 
 
-Qroot, Qdata: con iota;
+Qroot, Qctl, Qdata: con iota;
 tab := array[] of {
 	(Qroot,		".",	Sys->DMDIR|8r555),
+	(Qctl,		"ctl",	8r222),
 	(Qdata,		"data",	8r666),
-	# xxx also implement a ctl file to clear & forget the keystate.
 };
-Qfirst:	con Qdata;
+Qfirst:	con Qctl;
 Qlast:	con Qdata;
 
 srv: ref Styxserver;
@@ -58,6 +60,8 @@ init(nil: ref Draw->Context, args: list of string)
 	styxservers = load Styxservers Styxservers->PATH;
 	styxservers->init(styx);
 	kr = load Keyring Keyring->PATH;
+	fact = load Factotum Factotum->PATH;
+	fact->init();
 
 	sys->pctl(Sys->NEWPGRP, nil);
 
@@ -82,12 +86,6 @@ init(nil: ref Draw->Context, args: list of string)
 	msgc: chan of ref Tmsg;
 	(msgc, srv) = Styxserver.new(sys->fildes(0), nav, big Qroot);
 
-	# xxx get proper key somewhere (factotum)
-	cryptkey := array of byte "Ais5ahjei2uzeyoo";
-	say(sprint("len cryptkey=%d", len cryptkey));
-	keystate = kr->aessetup(cryptkey, nil);
-	zero(cryptkey);
-
 	filefd = sys->open(file, sys->ORDWR);
 	if(filefd == nil)
 		fail(sprint("open %q: %r", file));
@@ -109,6 +107,22 @@ done:
 		}
 		dostyx(gm);
 	}
+}
+
+ensurekey(): string
+{
+	if(keystate != nil)
+		return nil;
+
+	# xxx get proper key somewhere (factotum)
+	(nil, pass) := fact->getuserpasswd("proto=pass service=cryptfile");
+	if(pass == nil)
+		return "no key";
+	cryptkey := array of byte pass;
+	say(sprint("len cryptkey=%d", len cryptkey));
+	keystate = kr->aessetup(cryptkey, nil);
+	zero(cryptkey);
+	return nil;
 }
 
 bufincr(d: array of byte)
@@ -150,9 +164,15 @@ cbcsector(st: ref kr->AESstate, ivec: array of byte, buf: array of byte, directi
 	}
 }
 
-crypt(off: big, buf: array of byte, direction: int)
+crypt(off: big, buf: array of byte, direction: int): string
 {
 	#say(sprint("aes ecb off=%bd n=%d", off, len buf));
+
+	if(keystate == nil) {
+		err := ensurekey();
+		if(err != nil)
+			return err;
+	}
 
 	n := len buf/Sectorsize;
 	ctr := array[Bsize] of {* => byte 0};
@@ -172,6 +192,7 @@ crypt(off: big, buf: array of byte, direction: int)
 		bufincr(ctr);
 		buf = buf[Sectorsize:];
 	}
+	return nil;
 }
 
 aligned(off: big, n: int): string
@@ -195,7 +216,9 @@ dowrite(buf: array of byte, off: big): string
 	if(off+big len buf > filesize)
 		return "write outside file boundaries";
 
-	crypt(off, buf, kr->Encrypt);
+	err = crypt(off, buf, kr->Encrypt);
+	if(err != nil)
+		return err;
 	n := sys->pwrite(filefd, buf, len buf, off);
 	if(n < len buf)
 		return sprint("write: %r");
@@ -217,8 +240,8 @@ doread(n: int, off: big): (array of byte, string)
 	if(nn % Sectorsize != 0)
 		return (nil, "partial read misaligned");
 	buf = buf[:nn];
-	crypt(off, buf, kr->Decrypt);
-	return (buf, nil);
+	err = crypt(off, buf, kr->Decrypt);
+	return (buf, err);
 }
 
 dostyx(gm: ref Tmsg)
@@ -237,8 +260,15 @@ dostyx(gm: ref Tmsg)
 			return replyerror(m, err);
 		q := int f.path&16rff;
 
-		# xxx make sure write is on proper boundaries, and do write
 		case q {
+		Qctl =>
+			s := string m.data;
+			if(s == "forget" || s == "forget\n") {
+				keystate = nil; # xxx zero it somehow?
+				srv.reply(ref Rmsg.Write(m.tag, len m.data));
+			} else
+				replyerror(m, "bad ctl");
+				
 		Qdata =>
 			werr := dowrite(m.data, m.offset);
 			if(werr != nil)
@@ -277,18 +307,16 @@ dostyx(gm: ref Tmsg)
 		f := srv.getfid(m.fid);
 		q := int f.path&16rff;
 
-		if(q != Qdata) {
+		case q {
+		Qdata =>
+			# xxx only allow a "flush to disk" (nulldir) wstat?
+			srv.reply(ref Rmsg.Wstat(m.tag));
+		* =>
 			srv.default(m);
-			return;
 		}
-
-		# xxx handle case for Qdata, only allow a "flush to disk" (nulldir) wstat?
-
-		srv.reply(ref Rmsg.Wstat(m.tag));
 
 	Flush =>
 		srv.default(gm);
-
 	* =>
 		srv.default(gm);
 	}
@@ -329,7 +357,7 @@ again:
 				have := 0;
 				for(i := op.offset; have < op.count && i < avail; i++)
 					case Qfirst+i {
-					Qdata =>
+					Qctl or Qdata =>
 						op.reply <-= (dir(Qfirst+i, 0), nil);
 						have++;
 					* =>
