@@ -17,8 +17,9 @@ implement Cryptfile;
 # guessing is slow.
 #
 # `crypted' is the alg-cbc using the derived key of the concatenation of (only for aes for now):
-# - 28 byte random cookie
-# - sha1 of cookie || header
+# - random cookie, length is alg-bsize + leftover to make crypted a multiple of alg-bsize 
+# - `keylen' bits of key
+# - sha1 of cookie || key || header
 # where header is the header minus `crypted'.
 # this allows the password from the user to be verified.
 
@@ -58,7 +59,6 @@ Dflag, dflag, iflag: int;
 Sectorsize:	con 512;
 Hdrsize:	con 512;
 Bsize:	con kr->AESbsize;
-Cookiesize:	con 28; # 3*aesbsize-sha1dlen
 Saltlen: 	con 128; # bytes
 
 filefd:	ref Sys->FD;
@@ -141,15 +141,20 @@ init(nil: ref Draw->Context, args: list of string)
 
 	if(iflag) {
 		salt := random->randombuf(Random->NotQuiteRandom, Saltlen);
-		ivec := random->randombuf(Random->NotQuiteRandom, Bsize);
+		ivec := random->randombuf(Random->ReallyRandom, Bsize);
 		config = ref Cfg ("aes", 128, 10000, salt, ivec, nil);
+
+		key := random->randombuf(Random->ReallyRandom, 128/8);
+		config.crypted = makecrypted(config, key);
+		zero(key);
+
 		err := ensurekey();
 		if(err == nil)
 			err = writeheader(config, filefd);
 		if(err != nil)
 			fail(err);
 
-		# force keystate to be recalculated below, to test key derivation
+		# force keystate to be recalculated below, to test key derivation & verification
 		keystate = nil;
 	}
 
@@ -157,8 +162,6 @@ init(nil: ref Draw->Context, args: list of string)
 	(config, err) = readheader(filefd);
 	if(err == nil)
 		err = ensurekey();
-	if(err == nil)
-		err = cfgverify(config);
 	if(err != nil)
 		fail(err);
 
@@ -189,6 +192,88 @@ done:
 		dostyx(gm);
 	}
 	killgrp(sys->pctl(0, nil));
+}
+
+makecrypted(c: ref Cfg, key: array of byte): array of byte
+{
+	cfgbuf := array of byte cfgpack(c);
+
+	nkey := c.keylen/8;
+	nb := 1+(nkey+Bsize-1)/Bsize+(kr->SHA1dlen+Bsize-1)/Bsize;
+	crypted := array[nb*Bsize] of byte;
+
+	ncookie := len crypted-(c.keylen/8+kr->SHA1dlen);
+	cookie := random->randombuf(Random->NotQuiteRandom, ncookie);
+
+	crypted[:] = cookie;
+	crypted[ncookie:] = key;
+	dg := kr->sha1(crypted, ncookie+len key, nil, nil);
+	kr->sha1(cfgbuf, len cfgbuf, crypted[ncookie+len key:], dg);
+
+	(ukey, err) := getuserkey();
+	if(err != nil)
+		fail(err);
+	ks := kr->aessetup(ukey, c.ivec);
+	zero(ukey);
+	kr->aescbc(ks, crypted, len crypted, kr->Encrypt);
+	return crypted;
+}
+
+cfgpack(c: ref Cfg): string
+{
+	# note: without c.crypted
+	return sprint("%salg %s\nkeylen %d\nrounds %d\nsalt %s\nivec %s\n",
+			Hdr, c.alg, c.keylen, c.rounds,
+			base64->enc(c.salt), base64->enc(c.ivec));
+}
+
+verifysig(c: ref Cfg, buf: array of byte): string
+{
+	cfgbuf := array of byte cfgpack(c);
+	sig := array[kr->SHA1dlen] of byte;
+	dg := kr->sha1(buf, len buf-kr->SHA1dlen, nil, nil);
+	kr->sha1(cfgbuf, len cfgbuf, sig, dg);
+	if(!eq(buf[len buf-kr->SHA1dlen:], sig))
+		return "bad signature";
+	return nil;
+}
+
+getuserkey(): (array of byte, string)
+{
+	(nil, pass) := fact->getuserpasswd("proto=pass service=cryptfile "+keyspec);
+	if(pass == nil)
+		return (nil, "no key");
+	return pbkdf2->derivekey(array of byte pass, config.salt, config.keylen, config.rounds);
+}
+
+ensurekey(): string
+{
+	if(keystate != nil)
+		return nil;
+
+	(ukey, err) := getuserkey();
+	if(err != nil)
+		fail(err);
+
+	plain := array[len config.crypted] of byte;
+	plain[:] = config.crypted;
+
+	ks := kr->aessetup(ukey, config.ivec);
+	zero(ukey);
+	kr->aescbc(ks, plain, len plain, kr->Decrypt);
+
+	err = verifysig(config, plain);
+	if(err != nil)
+		return err;
+
+	nkey := config.keylen/8;
+	key := plain[len plain-(nkey+kr->SHA1dlen):];
+	keystate = kr->aessetup(key[:nkey], nil);
+	if(keystate == nil)
+		return sprint("key: %r");
+	zero(plain);
+
+	return nil;
 }
 
 getval(l, key: string): (string, string)
@@ -260,76 +345,36 @@ readheader(fd: ref Sys->FD): (ref Cfg, string)
 		ivec = base64->dec(v[4]);
 	if(err == nil)
 		crypted = base64->dec(v[5]);
-	if(err == nil && len crypted != Cookiesize+kr->SHA1dlen)
-		err = sprint("bad header, bad length for crypted (len crypted %d != %d)", len crypted, Cookiesize+kr->SHA1dlen);
+
 	cfg := ref Cfg (alg, keylen, rounds, salt, ivec, crypted);
+	if(err == nil && cfg.keylen != 128)
+		err = "only 128 bits keys supported for now";
+	if(err == nil && len cfg.salt != Saltlen)
+		err = sprint("bad header, len salt %d != %d", len cfg.salt, Saltlen);
+	if(err == nil && len cfg.crypted % Bsize != 0)
+		err = sprint("bad header, len crypted %d %% Bsize != 0", len crypted);
+	if(err == nil && len cfg.crypted < Bsize+Bsize+kr->SHA1dlen)
+		err = sprint("bad header, len crypted %d too small", len crypted);
 	return (cfg, err);
 }
 
-cfgpack(c: ref Cfg): string
-{
-	# note: without c.crypted!
-	return sprint("%salg %s\nkeylen %d\nrounds %d\nsalt %s\nivec %s\n",
-			Hdr, c.alg, c.keylen, c.rounds,
-			base64->enc(c.salt), base64->enc(c.ivec));
-}
-
-cfgverify(c: ref Cfg): string
-{
-	buf := array[len c.crypted] of byte;
-	buf[:] = c.crypted;
-	cbcsector(keystate, c.ivec, buf, len buf, kr->Decrypt);
-
-	cookie := buf[:Cookiesize];
-	cfgbuf := array of byte cfgpack(c);
-
-	sig := array[kr->SHA1dlen] of byte;
-	dg := kr->sha1(cookie, len cookie, nil, nil);
-	kr->sha1(cfgbuf, len cfgbuf, sig, dg);
-	if(!eq(sig, buf[len buf-kr->SHA1dlen:]))
-		return "bad signature in header";
-	return nil;
-}
 
 writeheader(c: ref Cfg, fd: ref Sys->FD): string
 {
-	buf := array[Sectorsize] of {* => byte 0};
-	
-	cookie := random->randombuf(Random->NotQuiteRandom, Cookiesize);
+	buf := array[Hdrsize] of {* => byte 0};
 	cfgbuf := array of byte cfgpack(c);
-	sig := array[kr->SHA1dlen] of byte;
-	dg := kr->sha1(cookie, len cookie, nil, nil);
-	kr->sha1(cfgbuf, len cfgbuf, sig, dg);
-
-	crypted := array[len cookie+len sig] of byte;
-	crypted[:] = cookie;
-	crypted[len cookie:] = sig;
-	cbcsector(keystate, c.ivec, crypted, len crypted, kr->Encrypt);
-
+	cryptbuf := sys->aprint("crypted %s\n", base64->enc(c.crypted));
+	if(len cfgbuf+len cryptbuf > len buf)
+		return "header too large";
 	buf[:] = cfgbuf;
-	buf[len cfgbuf:] = array of byte sprint("crypted %s\n", base64->enc(crypted));
-
+	buf[len cfgbuf:] = cryptbuf;
+	
 	n := sys->pwrite(fd, buf, len buf, big 0);
 	if(n != len buf)
 		return sprint("writing header: %r");
 	return nil;
 }
 
-ensurekey(): string
-{
-	if(keystate != nil)
-		return nil;
-
-	(nil, pass) := fact->getuserpasswd("proto=pass service=cryptfile "+keyspec);
-	if(pass == nil)
-		return "no key";
-	(key, err) := pbkdf2->derivekey(array of byte pass, config.salt, config.keylen, config.rounds);
-	if(err != nil)
-		return err;
-	keystate = kr->aessetup(key, nil);
-	zero(key);
-	return nil;
-}
 
 bufincr(d: array of byte)
 {
@@ -347,26 +392,19 @@ bufxor(dst, buf: array of byte, n: int)
 cbcsector(st: ref kr->AESstate, ivec: array of byte, buf: array of byte, n: int, direction: int)
 {
 	if(direction == kr->Encrypt) {
-		#say(sprint("cbc encrypt, ivec %s, len buf %d", hex(ivec), len buf));
 		bufxor(buf, ivec, len ivec);
 		kr->aesecb(st, buf, Bsize, kr->Encrypt);
 		for(o := Bsize; o < n; o += Bsize) {
 			bufxor(buf[o:], buf[o-Bsize:], Bsize);
 			kr->aesecb(st, buf[o:], Bsize, kr->Encrypt);
-			#say(sprint("cbc encrypt, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
 		}
 	} else {
-		#say(sprint("cbc decrypt, ivec %s, len buf %d", hex(ivec), len buf));
 		for(o := n-Bsize; o > 0; o -= Bsize) {
-			#say(sprint("cbc encrypt, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
 			kr->aesecb(st, buf[o:], Bsize, kr->Decrypt);
 			bufxor(buf[o:], buf[o-Bsize:], Bsize);
-			#say(sprint("cbc encrypt, o %d, plain %s", o, hex(buf[o:o+Bsize])));
 		}
-		#say(sprint("cbc encrypt last, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
 		kr->aesecb(st, buf[o:], Bsize, kr->Decrypt);
 		bufxor(buf[o:], ivec, len ivec);
-		#say(sprint("cbc encrypt last, o %d, plain %s", o, hex(buf[o:o+Bsize])));
 	}
 }
 
@@ -374,11 +412,9 @@ crypt(off: big, buf: array of byte, direction: int): string
 {
 	#say(sprint("aes ecb off=%bd n=%d", off, len buf));
 
-	if(keystate == nil) {
-		err := ensurekey();
-		if(err != nil)
-			return err;
-	}
+	err := ensurekey();
+	if(err != nil)
+		return err;
 
 	n := len buf/Sectorsize;
 	ctr := array[Bsize] of {* => byte 0};
