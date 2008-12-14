@@ -1,5 +1,27 @@
 implement Cryptfile;
 
+# first sector contains information about the cryptfile.  example format:
+# cryptfile0\n
+# alg aes\n
+# keylen 128\n
+# rounds 10000\n
+# salt base64salt\n
+# ivec base64ivec\n
+# crypted base64crypted\n
+#
+# base64* are base64-encoded strings.
+#
+# the key used to encrypt the data sectors is `keylen' bits,
+# calculated using `rounds' rounds of pbkdf2, with `salt'.
+# the calculation should take some time (e.g. a second), so password
+# guessing is slow.
+#
+# `crypted' is the alg-cbc using the derived key of the concatenation of (only for aes for now):
+# - 28 byte random cookie
+# - sha1 of cookie || header
+# where header is the header minus `crypted'.
+# this allows the password from the user to be verified.
+
 include "sys.m";
 	sys: Sys;
 	sprint: import sys;
@@ -10,6 +32,8 @@ include "bufio.m";
 	Iobuf: import bufio;
 include "string.m";
 	str: String;
+include "lists.m";
+	lists: Lists;
 include "daytime.m";
 	daytime: Daytime;
 include "styx.m";
@@ -18,20 +42,31 @@ include "styx.m";
 	Styxserver, Fid, Navigator, Navop: import styxservers;
 include "styxservers.m";
 	styxservers: Styxservers;
+include "security.m";
+	random: Random;
 include "keyring.m";
 	kr: Keyring;
 include "factotum.m";
 	fact: Factotum;
+include "encoding.m";
+	base64: Encoding;
+include "../lib/pbkdf2.m";
+	pbkdf2: Pbkdf2;
 
-Dflag, dflag: int;
+Dflag, dflag, iflag: int;
 
 Sectorsize:	con 512;
+Hdrsize:	con 512;
 Bsize:	con kr->AESbsize;
-filesize:	big;
-filefd:	ref Sys->FD;
-starttime:	int;
-keystate:	ref kr->AESstate;
+Cookiesize:	con 28; # 3*aesbsize-sha1dlen
+Saltlen: 	con 128; # bytes
 
+filefd:	ref Sys->FD;
+time0:	int;
+config:	ref Cfg;
+keyspec:	string;
+filesize:	big;
+keystate:	ref kr->AESstate;
 
 Qroot, Qctl, Qdata: con iota;
 tab := array[] of {
@@ -44,6 +79,16 @@ Qlast:	con Qdata;
 
 srv: ref Styxserver;
 
+Cfg: adt {
+	alg:	string;
+	keylen:	int;
+	rounds:	int;
+	salt:	array of byte;
+	ivec:	array of byte;
+	crypted:	array of byte;
+};
+Hdr: con "cryptfile0\n";
+
 Cryptfile: module {
 	init:	fn(nil: ref Draw->Context, args: list of string);
 };
@@ -54,37 +99,37 @@ init(nil: ref Draw->Context, args: list of string)
 	arg := load Arg Arg->PATH;
 	bufio = load Bufio Bufio->PATH;
 	str = load String String->PATH;
+	lists = load Lists Lists->PATH;
 	daytime = load Daytime Daytime->PATH;
 	styx = load Styx Styx->PATH;
 	styx->init();
 	styxservers = load Styxservers Styxservers->PATH;
 	styxservers->init(styx);
 	kr = load Keyring Keyring->PATH;
+	random = load Random Random->PATH;
 	fact = load Factotum Factotum->PATH;
 	fact->init();
+	base64 = load Encoding Encoding->BASE64PATH;
+	pbkdf2 = load Pbkdf2 Pbkdf2->PATH;
+	pbkdf2->init();
 
 	sys->pctl(Sys->NEWPGRP, nil);
 
 	arg->init(args);
-	arg->setusage(arg->progname()+" [-Dd] file");
+	arg->setusage(arg->progname()+" [-Ddi] [-k keyspec] file");
 	while((c := arg->opt()) != 0)
 		case c {
 		'D' =>	Dflag++;
 			styxservers->traceset(Dflag);
 		'd' =>	dflag++;
+		'i' =>	iflag++;
+		'k' =>	keyspec = arg->earg();
 		* =>	arg->usage();
 		}
 	args = arg->argv();
 	if(len args != 1)
 		arg->usage();
 	file := hd args;
-
-	navch := chan of ref Navop;
-	spawn navigator(navch);
-
-	nav := Navigator.new(navch);
-	msgc: chan of ref Tmsg;
-	(msgc, srv) = Styxserver.new(sys->fildes(0), nav, big Qroot);
 
 	filefd = sys->open(file, sys->ORDWR);
 	if(filefd == nil)
@@ -93,13 +138,49 @@ init(nil: ref Draw->Context, args: list of string)
 	if(ok != 0)
 		fail(sprint("fstat %q", file));
 	filesize = dir.length;
-	starttime = daytime->now();
 
+	if(iflag) {
+		salt := random->randombuf(Random->NotQuiteRandom, Saltlen);
+		ivec := random->randombuf(Random->NotQuiteRandom, Bsize);
+		config = ref Cfg ("aes", 128, 10000, salt, ivec, nil);
+		err := ensurekey();
+		if(err == nil)
+			err = writeheader(config, filefd);
+		if(err != nil)
+			fail(err);
+
+		# force keystate to be recalculated below, to test key derivation
+		keystate = nil;
+	}
+
+	err: string;
+	(config, err) = readheader(filefd);
+	if(err == nil)
+		err = ensurekey();
+	if(err == nil)
+		err = cfgverify(config);
+	if(err != nil)
+		fail(err);
+
+	time0 = daytime->now();
+
+	navch := chan of ref Navop;
+	spawn navigator(navch);
+
+	nav := Navigator.new(navch);
+	msgc: chan of ref Tmsg;
+	(msgc, srv) = Styxserver.new(sys->fildes(0), nav, big Qroot);
+
+	spawn serve(msgc);
+}
+
+serve(msgc: chan of ref Tmsg)
+{
 done:
 	for(;;) alt {
 	gm := <-msgc =>
 		if(gm == nil)
-			break;
+			break done;
 		pick m := gm {
 		Readerror =>
 			warn("read error: "+m.error);
@@ -107,6 +188,131 @@ done:
 		}
 		dostyx(gm);
 	}
+	killgrp(sys->pctl(0, nil));
+}
+
+getval(l, key: string): (string, string)
+{
+	if(!str->prefix(key+" ", l))
+		return (nil, sprint("bad header, missing key %#q", key));
+	return (l[len key+1:], nil);
+}
+
+getint(key, s: string): (int, string)
+{
+	if(str->drop(s, "0-9") != nil)
+		return (0, sprint("bad header, key %#q: not a number", key));
+	return (int s, nil);
+}
+
+lines(s: string): list of string
+{
+	l: list of string;
+	line: string;
+	for(;;) {
+		if(s == nil || s[0] == '\0')
+			break;
+		(line, s) = str->splitstrl(s, "\n");
+		if(s != nil)
+			s = s[1:];
+		l = line::l;
+	}
+	return lists->reverse(l);
+}
+
+readheader(fd: ref Sys->FD): (ref Cfg, string)
+{
+	buf := array[Hdrsize] of byte;
+	n := preadn(fd, buf, len buf, big 0);
+	if(n < 0)
+		fail(sprint("reading header: %r"));
+	if(n != len buf)
+		fail("short read for header");
+
+	s := string buf;
+	if(!str->prefix(Hdr, s))
+		return (nil, "bad header, not a cryptfile");
+	s = s[len Hdr:];
+
+	l := lines(s);
+	if(len l != 6)
+		return (nil, sprint("bad header, wrong number of lines (%d)", len l));
+
+	a := l2a(l);
+	v := array[len a] of string;
+	keys := array[] of {"alg", "keylen", "rounds", "salt", "ivec", "crypted"};
+	err: string;
+	for(i := 0; err == nil && i < len keys; i++)
+		(v[i], err) = getval(a[i], keys[i]);
+
+	alg: string;
+	keylen, rounds: int;
+	salt, ivec, crypted: array of byte;
+	if(err == nil && (alg = v[0]) != "aes")
+		err = sprint("alg not 'aes': %#q", alg);
+	if(err == nil)
+		(keylen, err) = getint(keys[1], v[1]);
+	if(err == nil)
+		(rounds, err) = getint(keys[2], v[2]);
+	if(err == nil)
+		salt = base64->dec(v[3]);
+	if(err == nil)
+		ivec = base64->dec(v[4]);
+	if(err == nil)
+		crypted = base64->dec(v[5]);
+	if(err == nil && len crypted != Cookiesize+kr->SHA1dlen)
+		err = sprint("bad header, bad length for crypted (len crypted %d != %d)", len crypted, Cookiesize+kr->SHA1dlen);
+	cfg := ref Cfg (alg, keylen, rounds, salt, ivec, crypted);
+	return (cfg, err);
+}
+
+cfgpack(c: ref Cfg): string
+{
+	# note: without c.crypted!
+	return sprint("%salg %s\nkeylen %d\nrounds %d\nsalt %s\nivec %s\n",
+			Hdr, c.alg, c.keylen, c.rounds,
+			base64->enc(c.salt), base64->enc(c.ivec));
+}
+
+cfgverify(c: ref Cfg): string
+{
+	buf := array[len c.crypted] of byte;
+	buf[:] = c.crypted;
+	cbcsector(keystate, c.ivec, buf, len buf, kr->Decrypt);
+
+	cookie := buf[:Cookiesize];
+	cfgbuf := array of byte cfgpack(c);
+
+	sig := array[kr->SHA1dlen] of byte;
+	dg := kr->sha1(cookie, len cookie, nil, nil);
+	kr->sha1(cfgbuf, len cfgbuf, sig, dg);
+	if(!eq(sig, buf[len buf-kr->SHA1dlen:]))
+		return "bad signature in header";
+	return nil;
+}
+
+writeheader(c: ref Cfg, fd: ref Sys->FD): string
+{
+	buf := array[Sectorsize] of {* => byte 0};
+	
+	cookie := random->randombuf(Random->NotQuiteRandom, Cookiesize);
+	cfgbuf := array of byte cfgpack(c);
+	sig := array[kr->SHA1dlen] of byte;
+	dg := kr->sha1(cookie, len cookie, nil, nil);
+	kr->sha1(cfgbuf, len cfgbuf, sig, dg);
+
+	crypted := array[len cookie+len sig] of byte;
+	crypted[:] = cookie;
+	crypted[len cookie:] = sig;
+	cbcsector(keystate, c.ivec, crypted, len crypted, kr->Encrypt);
+
+	buf[:] = cfgbuf;
+	buf[len cfgbuf:] = array of byte sprint("crypted %s\n", base64->enc(crypted));
+
+	n := sys->pwrite(fd, buf, len buf, big 0);
+	if(n != len buf)
+		return sprint("writing header: %r");
+	return nil;
 }
 
 ensurekey(): string
@@ -114,14 +320,14 @@ ensurekey(): string
 	if(keystate != nil)
 		return nil;
 
-	# xxx get proper key somewhere (factotum)
-	(nil, pass) := fact->getuserpasswd("proto=pass service=cryptfile");
+	(nil, pass) := fact->getuserpasswd("proto=pass service=cryptfile "+keyspec);
 	if(pass == nil)
 		return "no key";
-	cryptkey := array of byte pass;
-	say(sprint("len cryptkey=%d", len cryptkey));
-	keystate = kr->aessetup(cryptkey, nil);
-	zero(cryptkey);
+	(key, err) := pbkdf2->derivekey(array of byte pass, config.salt, config.keylen, config.rounds);
+	if(err != nil)
+		return err;
+	keystate = kr->aessetup(key, nil);
+	zero(key);
 	return nil;
 }
 
@@ -138,20 +344,20 @@ bufxor(dst, buf: array of byte, n: int)
 		dst[i] ^= buf[i];
 }
 
-cbcsector(st: ref kr->AESstate, ivec: array of byte, buf: array of byte, direction: int)
+cbcsector(st: ref kr->AESstate, ivec: array of byte, buf: array of byte, n: int, direction: int)
 {
 	if(direction == kr->Encrypt) {
 		#say(sprint("cbc encrypt, ivec %s, len buf %d", hex(ivec), len buf));
 		bufxor(buf, ivec, len ivec);
 		kr->aesecb(st, buf, Bsize, kr->Encrypt);
-		for(o := Bsize; o < Sectorsize; o += Bsize) {
+		for(o := Bsize; o < n; o += Bsize) {
 			bufxor(buf[o:], buf[o-Bsize:], Bsize);
 			kr->aesecb(st, buf[o:], Bsize, kr->Encrypt);
 			#say(sprint("cbc encrypt, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
 		}
 	} else {
 		#say(sprint("cbc decrypt, ivec %s, len buf %d", hex(ivec), len buf));
-		for(o := Sectorsize-Bsize; o > 0; o -= Bsize) {
+		for(o := n-Bsize; o > 0; o -= Bsize) {
 			#say(sprint("cbc encrypt, o %d, cipher %s", o, hex(buf[o:o+Bsize])));
 			kr->aesecb(st, buf[o:], Bsize, kr->Decrypt);
 			bufxor(buf[o:], buf[o-Bsize:], Bsize);
@@ -186,7 +392,7 @@ crypt(off: big, buf: array of byte, direction: int): string
 		kr->aesecb(keystate, xor, len xor, kr->Encrypt);
 
 		# then cbc the data with the ivec
-		cbcsector(keystate, xor, buf, direction);
+		cbcsector(keystate, xor, buf, Sectorsize, direction);
 
 		# and prepare for the next
 		bufincr(ctr);
@@ -219,7 +425,7 @@ dowrite(buf: array of byte, off: big): string
 	err = crypt(off, buf, kr->Encrypt);
 	if(err != nil)
 		return err;
-	n := sys->pwrite(filefd, buf, len buf, off);
+	n := sys->pwrite(filefd, buf, len buf, off+big Hdrsize);
 	if(n < len buf)
 		return sprint("write: %r");
 	return nil;
@@ -234,7 +440,7 @@ doread(n: int, off: big): (array of byte, string)
 		return (nil, "read: "+err);
 
 	buf := array[n] of byte;
-	nn := preadn(filefd, buf, len buf, big off);
+	nn := preadn(filefd, buf, len buf, off+big Hdrsize);
 	if(nn < 0)
 		return (nil, sprint("read: %r"));
 	if(nn % Sectorsize != 0)
@@ -264,7 +470,7 @@ dostyx(gm: ref Tmsg)
 		Qctl =>
 			s := string m.data;
 			if(s == "forget" || s == "forget\n") {
-				keystate = nil; # xxx zero it somehow?
+				keystate = nil;
 				srv.reply(ref Rmsg.Write(m.tag, len m.data));
 			} else
 				replyerror(m, "bad ctl");
@@ -288,7 +494,6 @@ dostyx(gm: ref Tmsg)
 			srv.default(m);
 			return;
 		}
-		say(sprint("read f.path=%bd", f.path));
 		q := int f.path&16rff;
 
 		case q {
@@ -327,7 +532,6 @@ navigator(c: chan of ref Navop)
 again:
 	for(;;) {
 		navop := <-c;
-		say(sprint("have navop, tag %d", tagof navop));
 		q := int (navop.path&big 16rff);
 
 		pick op := navop {
@@ -343,7 +547,7 @@ again:
 			Qroot =>
 				for(i := Qfirst; i <= Qlast; i++)
 					if(tab[i].t1 == op.name) {
-						op.reply <-= (dir(tab[i].t0, starttime), nil);
+						op.reply <-= (dir(tab[i].t0, time0), nil);
 						continue again;
 					}
 				op.reply <-= (nil, styxservers->Enotfound);
@@ -385,7 +589,7 @@ dir(path, mtime: int): ref Sys->Dir
 	d.mtime = d.atime = mtime;
 	d.mode = perm;
 	if(path == Qdata)
-		d.length = filesize;
+		d.length = filesize-big Hdrsize;
 	return d;
 }
 
@@ -418,6 +622,16 @@ hex(d: array of byte): string
 	return s;
 }
 
+eq(a, b: array of byte): int
+{
+	if(len a != len b)
+		return 0;
+	for(i := 0; i < len a; i++)
+		if(a[i] != b[i])
+			return 0;
+	return 1;
+}
+
 p64(d: array of byte, v: big)
 {
 	d = d[len d-8:];
@@ -437,11 +651,25 @@ zero(d: array of byte)
 	d[:] = array[len d] of {* => byte '0'};
 }
 
-kill(pid: int)
+l2a[T](l: list of T): array of T
+{
+	a := array[len l] of T;
+	i := 0;
+	for(; l != nil; l = tl l)
+		a[i++] = hd l;
+	return a;
+}
+
+progctl(pid: int, ctl: string)
 {
 	fd := sys->open(sprint("/prog/%d/ctl", pid), Sys->OWRITE);
 	if(fd != nil)
-		sys->fprint(fd, "kill");
+		sys->fprint(fd, "%s", ctl);
+}
+
+killgrp(pid: int)
+{
+	progctl(pid, "killgrp");
 }
 
 warn(s: string)
@@ -458,5 +686,6 @@ say(s: string)
 fail(s: string)
 {
 	warn(s);
+	killgrp(sys->pctl(0, nil));
 	raise "fail:"+s;
 }

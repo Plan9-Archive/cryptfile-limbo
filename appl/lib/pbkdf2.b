@@ -27,17 +27,15 @@ prf(unew, pass, uprev: array of byte)
 
 f(block, pass, salt: array of byte, rounds, i: int)
 {
-	saltint := array[len salt + 4] of byte;
-	for(j := 0; j < len salt; j++)
-		saltint[j] = salt[j];
-
-	p32(saltint, i);
+	saltint := array[len salt+4] of byte;
+	saltint[:] = salt;
+	p32(saltint[len salt:], i);
 	prf(block, pass, saltint);
 
 	unew := array[len block] of byte;
 	for(k := 1; k < rounds; k++) {
 		prf(unew, pass, block);
-		for(j = 0; j < len unew; j++)
+		for(j := 0; j < len unew; j++)
 			block[j] ^= unew[j];
 	}
 }

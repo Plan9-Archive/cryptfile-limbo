@@ -1,3 +1,8 @@
 # warning
 
 do not use!  there is no real encryption yet.  so for now, there is only work on the programming side of things.
+
+# todo
+- make flushing wstat (all don't-cares) do the same on the underlying fd.
+- store key in the header, and use that for crypto.  allows changing
+  the user password without having the reencrypt the entire file.
