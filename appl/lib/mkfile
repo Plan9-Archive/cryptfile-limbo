@@ -1,8 +1,10 @@
 <../../mkconfig
 
 TARG=\
+	pbkdf2.dis\
 
 MODULES=\
+	pbkdf2.m\
 
 SYSMODULES=\
 	sys.m\

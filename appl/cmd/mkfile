@@ -2,8 +2,10 @@
 
 TARG=\
 	cryptfile.dis\
-	pbkdf2.dis\
 	testpbkdf2.dis\
+
+MODULES=\
+	../lib/pbkdf2.m\
 
 SYSMODULES=\
 	arg.m\
