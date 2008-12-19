@@ -550,7 +550,10 @@ dostyx(gm: ref Tmsg)
 
 		case q {
 		Qdata =>
-			# xxx only allow a "flush to disk" (nulldir) wstat?
+			if(!eq(styx->packdir(m.stat), styx->packdir(sys->nulldir)))
+				return replyerror(m, "only flushing-wstat allowed");
+			if(sys->fwstat(filefd, sys->nulldir) != 0)
+				return replyerror(m, sprint("flush: %r"));
 			srv.reply(ref Rmsg.Wstat(m.tag));
 		* =>
 			srv.default(m);
