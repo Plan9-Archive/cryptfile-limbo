@@ -4,9 +4,6 @@ implement Pbkdf2;
 
 include "sys.m";
 	sys: Sys;
-include "bufio.m";
-	bufio: Bufio;
-	Iobuf: import bufio;
 include "security.m";
 include "keyring.m";
 	kr: Keyring;
@@ -16,7 +13,6 @@ include "pbkdf2.m";
 init()
 {
 	sys = load Sys Sys->PATH;
-	bufio = load Bufio Bufio->PATH;
 	kr = load Keyring Keyring->PATH;
 }
 
@@ -25,13 +21,16 @@ prf(unew, pass, uprev: array of byte)
 	kr->hmac_sha1(uprev, len uprev, pass, unew, nil);
 }
 
+# F = U_1 \xor U_2 \xor ... \xor U_c
 f(block, pass, salt: array of byte, rounds, i: int)
 {
+	# U_1 = PRF (P, S || INT (i))
 	saltint := array[len salt+4] of byte;
 	saltint[:] = salt;
 	p32(saltint[len salt:], i);
 	prf(block, pass, saltint);
 
+	# U_2 = PRF (P, U_1) etc.
 	unew := array[len block] of byte;
 	for(k := 1; k < rounds; k++) {
 		prf(unew, pass, block);
