@@ -2,9 +2,11 @@
 
 TARG=\
 	pbkdf2.dis\
+	aesxts.dis\
 
 MODULES=\
 	pbkdf2.m\
+	aesxts.m\
 
 SYSMODULES=\
 	sys.m\

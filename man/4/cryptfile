@@ -1,0 +1,140 @@
+.TH CRYPTFILE 4
+
+.SH NAME
+cryptfile \- encrypted block file
+
+.SH SYNOPSIS
+.B cryptfile
+[
+.B -Ddi
+] [
+.B -k
+.I keyspec
+] [
+.B -m
+.I mode
+] [
+.B -l
+.I keybits
+]
+.I file
+
+.SH DESCRIPTION
+.B Cryptfile
+provides unencrypted acces to the encrypted
+.IR file .
+.I File
+contains the encrypted data which cryptfile serves as a file called ``data'' over styx.
+It allows random access on sector boundaries (512 bytes currently).
+Two modes of operation are supported:  XTS (recommended) and CBC
+with sector-encrypted IV's.  The encryption algorithm is AES with
+key lengths of 128, 192 or 256 bits.  The first two sectors of
+.I file
+contain a header with all information except the password to start
+serving the decrypted file.
+
+.SS Options
+.TP
+.B -D
+Print styx trace messages.
+.TP
+.B -d
+Print debugging messages.
+.TP
+.B -i
+Initialize 
+.I file
+with new parameters (a new salt for the password, and new key for
+the data).  Parameters can be set with
+.BR -l and
+.BR -m .
+.TP
+.BI -k " keyspec"
+Add
+.I keyspec
+to the request to factotum for the password.
+.TP
+.BI -l " keybits"
+The length of the key to use for the AES encryption, in bits.  The
+default is 128.  Valid values:  128, 192, 256.
+.TP
+.BI -m " mode"
+The mode of encryption.  Possible values:  "aes-cbc", "aes-xts".
+The default is "aes-xts".
+
+.SS Security
+The first two sectors of
+.I file
+contains a header, all later sectors contain the encrypted data.
+At startup (and on the ``data'' read/write after a ``forget'' ctl
+message), the following steps are executed:
+
+.PP
+- Request a password from factotum.
+.br
+- Use ``Password Based Key Derivation Function 2.0'' (PKCS#5) to
+derive a key from the password.  The salt, number of rounds and
+number of bits are taken from the header.
+.br
+- The initialization vector from the header and the derived key
+are used to decrypt the actual key used for encrypting/decrypting.
+The data decrypted is actually:
+random cookie || key || (sha1 of random cookie || key || header).
+.br
+
+Use of the key derivation function makes password guessing inefficient
+(the salt prevents use of pre-calculated dictionaries).  Using a
+key stored in the header, instead of directly using the derived
+key, makes it possible to change the password without having to
+re-encrypt all data.  The (encrypted) SHA1-hash along with the
+(encrypted) key allows verification of the user-entered password,
+preventing misinterpretation and possible destruction (by overwriting
+by e.g. file system repair tools) of data.
+
+XTS (XEX-TCB-CTS (sic)) is the recommended mode.  It is a ``tweaked''
+mode and ensures that each sector has a different ciphertext, even
+when storing the same data.  The CTS part is for sector sizes that
+are not a multiple of the encryption algorithm block size.  Since
+this is very uncommon, it is not implemented.
+
+The CBC-mode encrypts each sector in CBC-mode with the encrypted
+sector number as IV.  This too ensures that a plaintext has a
+different ciphertext on each sector it is stored.
+
+.SS Styx
+Accessing the file ``data'' at non-sector-boundary offsets, or with a length
+not a multiple of the sector size, the operation fails.  Otherwise
+it is just like any other file.  A null wstat causes a flush of the
+underlying file.
+Additionally, a file ``ctl'' is served.  The following commands are understood:
+.TP
+.B forget
+Remove the keys from memory.  Subsequent access to the file causes
+a new request to factotum for the password.
+.TP
+.BR debug " or " nodebug
+Enable/disable styx trace printing, and debug message printing.
+
+.SH EXAMPLE
+The initialize an encrypted file and start a fresh kfs on it:
+.EX
+	mount -A {cryptfile -i -m aes-xts -l 128 $home/encrypted} /n/decrypted/
+	mount -A {disk/kfs -r /n/decrypted/data} /n/kfs
+.EE
+And to mount a previously initialized encrypted file:
+.EX
+	mount -A {cryptfile $home/encrypted} /n/decrypted/
+.EE
+
+.SH SOURCE
+.B /appl/cmd/cryptfile.b
+.br
+.B /appl/lib/aesxts.b
+.br
+.B /appl/lib/pbkdf2.b
+
+.SH SEE ALSO
+.IR factotum (4).
+
+.SH BUGS
+It might not be the best idea to make the header with the real encryption key verifiable.

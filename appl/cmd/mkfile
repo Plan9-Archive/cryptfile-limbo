@@ -2,10 +2,12 @@
 
 TARG=\
 	cryptfile.dis\
-	testpbkdf2.dis\
+	#testpbkdf2.dis\
+	#testxts.dis\
 
 MODULES=\
 	../lib/pbkdf2.m\
+	../lib/aesxts.m\
 
 SYSMODULES=\
 	arg.m\

@@ -2,8 +2,8 @@ implement Cryptfile;
 
 # first sector contains information about the cryptfile.  example format:
 # cryptfile0\n
-# alg aes\n
-# keylen 128\n
+# alg aes-xts\n
+# keybits 128\n
 # rounds 10000\n
 # salt base64salt\n
 # ivec base64ivec\n
@@ -11,17 +11,20 @@ implement Cryptfile;
 #
 # base64* are base64-encoded strings.
 #
-# the key used to encrypt the data sectors is `keylen' bits,
+# the key used to encrypt the data sectors is `keybits' bits,
 # calculated using `rounds' rounds of pbkdf2, with `salt'.
 # the calculation should take some time (e.g. a second), so password
 # guessing is slow.
 #
 # `crypted' is the alg-cbc using the derived key of the concatenation of (only for aes for now):
 # - random cookie, length is alg-bsize + leftover to make crypted a multiple of alg-bsize 
-# - `keylen' bits of key
+# - key: `keybits' bits of key for aes-cbc, 2*`keybits' of key for aes-xts
 # - sha1 of cookie || key || header
 # where header is the header minus `crypted'.
 # this allows the password from the user to be verified.
+#
+# alg can be "aes-cbc" for cbc with sector number-encrypted iv, or
+# "aes-xts" for xts (both with aes).
 
 include "sys.m";
 	sys: Sys;
@@ -51,15 +54,21 @@ include "factotum.m";
 	fact: Factotum;
 include "encoding.m";
 	base64: Encoding;
+include "../lib/aesxts.m";
+	aesxts: Aesxts;
 include "../lib/pbkdf2.m";
 	pbkdf2: Pbkdf2;
 
 Dflag, dflag, iflag: int;
 
 Sectorsize:	con 512;
-Hdrsize:	con 512;
+Hdrsize:	con 2*Sectorsize;
 Bsize:	con kr->AESbsize;
 Saltlen: 	con 128; # bytes
+
+Aaescbc, Aaesxts: con iota;
+algnames := array[] of {"aes-cbc", "aes-xts"};
+Keybits:	con 128; # default bits of key
 
 filefd:	ref Sys->FD;
 time0:	int;
@@ -67,6 +76,7 @@ config:	ref Cfg;
 keyspec:	string;
 filesize:	big;
 keystate:	ref kr->AESstate;
+keystatex:	ref kr->AESstate; # for xts-mode only
 
 Qroot, Qctl, Qdata: con iota;
 tab := array[] of {
@@ -80,8 +90,8 @@ Qlast:	con Qdata;
 srv: ref Styxserver;
 
 Cfg: adt {
-	alg:	string;
-	keylen:	int;
+	alg:	int;
+	keybits:	int;
 	rounds:	int;
 	salt:	array of byte;
 	ivec:	array of byte;
@@ -110,13 +120,17 @@ init(nil: ref Draw->Context, args: list of string)
 	fact = load Factotum Factotum->PATH;
 	fact->init();
 	base64 = load Encoding Encoding->BASE64PATH;
+	aesxts = load Aesxts Aesxts->PATH;
+	aesxts->init();
 	pbkdf2 = load Pbkdf2 Pbkdf2->PATH;
 	pbkdf2->init();
 
 	sys->pctl(Sys->NEWPGRP, nil);
 
+	alg := Aaesxts;
+	keybits := Keybits;
 	arg->init(args);
-	arg->setusage(arg->progname()+" [-Ddi] [-k keyspec] file");
+	arg->setusage(arg->progname()+" [-Ddi] [-k keyspec] [-m mode] [-l keybits] file");
 	while((c := arg->opt()) != 0)
 		case c {
 		'D' =>	Dflag++;
@@ -124,6 +138,12 @@ init(nil: ref Draw->Context, args: list of string)
 		'd' =>	dflag++;
 		'i' =>	iflag++;
 		'k' =>	keyspec = arg->earg();
+		'l' =>	keybits = int arg->earg();
+			if(keybits % 8 != 0)
+				arg->usage();
+		'm' =>	alg = algfind(arg->earg());
+			if(alg < 0)
+				arg->usage();
 		* =>	arg->usage();
 		}
 	args = arg->argv();
@@ -142,9 +162,11 @@ init(nil: ref Draw->Context, args: list of string)
 	if(iflag) {
 		salt := random->randombuf(Random->NotQuiteRandom, Saltlen);
 		ivec := random->randombuf(Random->ReallyRandom, Bsize);
-		config = ref Cfg ("aes", 128, 10000, salt, ivec, nil);
+		config = ref Cfg (alg, keybits, 10000, salt, ivec, nil);
 
-		key := random->randombuf(Random->ReallyRandom, 128/8);
+		if(alg == Aaesxts)
+			keybits *= 2; # need two keys, for block & tweak
+		key := random->randombuf(Random->ReallyRandom, keybits/8);
 		config.crypted = makecrypted(config, key);
 		zero(key);
 
@@ -155,7 +177,7 @@ init(nil: ref Draw->Context, args: list of string)
 			fail(err);
 
 		# force keystate to be recalculated below, to test key derivation & verification
-		keystate = nil;
+		keystate = keystatex = nil;
 	}
 
 	err: string;
@@ -194,21 +216,26 @@ done:
 	killgrp(sys->pctl(0, nil));
 }
 
+algfind(s: string): int
+{
+	for(i := 0; i < len algnames; i++)
+		if(algnames[i] == s)
+			return i;
+	return -1;
+}
+
 makecrypted(c: ref Cfg, key: array of byte): array of byte
 {
 	cfgbuf := array of byte cfgpack(c);
 
-	nkey := c.keylen/8;
-	nb := 1+(nkey+Bsize-1)/Bsize+(kr->SHA1dlen+Bsize-1)/Bsize;
-	crypted := array[nb*Bsize] of byte;
+	length := Bsize*((Bsize+len key+kr->SHA1dlen)/Bsize);
+	crypted := array[length] of byte;
 
-	ncookie := len crypted-(c.keylen/8+kr->SHA1dlen);
-	cookie := random->randombuf(Random->NotQuiteRandom, ncookie);
-
+	cookie := random->randombuf(Random->NotQuiteRandom, len crypted-(len key+kr->SHA1dlen));
 	crypted[:] = cookie;
-	crypted[ncookie:] = key;
-	dg := kr->sha1(crypted, ncookie+len key, nil, nil);
-	kr->sha1(cfgbuf, len cfgbuf, crypted[ncookie+len key:], dg);
+	crypted[len cookie:] = key;
+	dg := kr->sha1(crypted, len cookie+len key, nil, nil);
+	kr->sha1(cfgbuf, len cfgbuf, crypted[len cookie+len key:], dg);
 
 	(ukey, err) := getuserkey();
 	if(err != nil)
@@ -222,8 +249,8 @@ makecrypted(c: ref Cfg, key: array of byte): array of byte
 cfgpack(c: ref Cfg): string
 {
 	# note: without c.crypted
-	return sprint("%salg %s\nkeylen %d\nrounds %d\nsalt %s\nivec %s\n",
-			Hdr, c.alg, c.keylen, c.rounds,
+	return sprint("%salg %s\nkeybits %d\nrounds %d\nsalt %s\nivec %s\n",
+			Hdr, algnames[c.alg], c.keybits, c.rounds,
 			base64->enc(c.salt), base64->enc(c.ivec));
 }
 
@@ -243,7 +270,7 @@ getuserkey(): (array of byte, string)
 	(nil, pass) := fact->getuserpasswd("proto=pass service=cryptfile "+keyspec);
 	if(pass == nil)
 		return (nil, "no key");
-	return pbkdf2->derivekey(array of byte pass, config.salt, config.keylen, config.rounds);
+	return pbkdf2->derivekey(array of byte pass, config.salt, config.keybits, config.rounds);
 }
 
 ensurekey(): string
@@ -266,10 +293,18 @@ ensurekey(): string
 	if(err != nil)
 		return err;
 
-	nkey := config.keylen/8;
+	nkey := config.keybits/8;
+	if(config.alg == Aaesxts)
+		nkey *= 2;
 	key := plain[len plain-(nkey+kr->SHA1dlen):];
-	keystate = kr->aessetup(key[:nkey], nil);
-	if(keystate == nil)
+	case config.alg {
+	Aaesxts =>
+		keystate = kr->aessetup(key[:nkey/2], nil);
+		keystatex = kr->aessetup(key[nkey/2:nkey], nil);
+	Aaescbc =>
+		keystate = kr->aessetup(key[:nkey], nil);
+	}
+	if(keystate == nil || (config.alg == Aaesxts && keystatex == nil))
 		return sprint("key: %r");
 	zero(plain);
 
@@ -325,18 +360,18 @@ readheader(fd: ref Sys->FD): (ref Cfg, string)
 
 	a := l2a(l);
 	v := array[len a] of string;
-	keys := array[] of {"alg", "keylen", "rounds", "salt", "ivec", "crypted"};
+	keys := array[] of {"alg", "keybits", "rounds", "salt", "ivec", "crypted"};
 	err: string;
 	for(i := 0; err == nil && i < len keys; i++)
 		(v[i], err) = getval(a[i], keys[i]);
 
-	alg: string;
-	keylen, rounds: int;
+	alg: int;
+	keybits, rounds: int;
 	salt, ivec, crypted: array of byte;
-	if(err == nil && (alg = v[0]) != "aes")
-		err = sprint("alg not 'aes': %#q", alg);
+	if(err == nil && (alg = algfind(v[0])) < 0)
+		err = sprint("alg unknown: %#q", v[0]);
 	if(err == nil)
-		(keylen, err) = getint(keys[1], v[1]);
+		(keybits, err) = getint(keys[1], v[1]);
 	if(err == nil)
 		(rounds, err) = getint(keys[2], v[2]);
 	if(err == nil)
@@ -346,14 +381,14 @@ readheader(fd: ref Sys->FD): (ref Cfg, string)
 	if(err == nil)
 		crypted = base64->dec(v[5]);
 
-	cfg := ref Cfg (alg, keylen, rounds, salt, ivec, crypted);
-	if(err == nil && cfg.keylen != 128)
-		err = "only 128 bits keys supported for now";
+	cfg := ref Cfg (alg, keybits, rounds, salt, ivec, crypted);
+	if(err == nil && cfg.keybits != 128 && cfg.keybits != 192 && cfg.keybits != 256)
+		err = sprint("bad number key length (%d bits) not supported", cfg.keybits);
 	if(err == nil && len cfg.salt != Saltlen)
 		err = sprint("bad header, len salt %d != %d", len cfg.salt, Saltlen);
 	if(err == nil && len cfg.crypted % Bsize != 0)
 		err = sprint("bad header, len crypted %d %% Bsize != 0", len crypted);
-	if(err == nil && len cfg.crypted < Bsize+Bsize+kr->SHA1dlen)
+	if(err == nil && len cfg.crypted < Bsize*((Bsize+cfg.keybits/8+kr->SHA1dlen)/Bsize))
 		err = sprint("bad header, len crypted %d too small", len crypted);
 	return (cfg, err);
 }
@@ -372,6 +407,21 @@ writeheader(c: ref Cfg, fd: ref Sys->FD): string
 	n := sys->pwrite(fd, buf, len buf, big 0);
 	if(n != len buf)
 		return sprint("writing header: %r");
+	return nil;
+}
+
+cryptxts(off: big, buf: array of byte, direction: int): string
+{
+	if(dflag) say(sprint("crypt xts off=%bd n=%d", off, len buf));
+	err := ensurekey();
+	if(err != nil)
+		return err;
+
+	sector := off/big Sectorsize;
+	for(o := 0; o < len buf; o += Sectorsize) {
+		if(dflag) say(sprint("cryptxts, sector %bd", sector));
+		aesxts->crypt(keystate, keystatex, sector++, buf[o:], Sectorsize, direction);
+	}
 	return nil;
 }
 
@@ -408,9 +458,9 @@ cbcsector(st: ref kr->AESstate, ivec: array of byte, buf: array of byte, n: int,
 	}
 }
 
-crypt(off: big, buf: array of byte, direction: int): string
+cryptcbc(off: big, buf: array of byte, direction: int): string
 {
-	#say(sprint("aes ecb off=%bd n=%d", off, len buf));
+	if(dflag) say(sprint("crypt cbc off=%bd n=%d", off, len buf));
 
 	err := ensurekey();
 	if(err != nil)
@@ -420,7 +470,7 @@ crypt(off: big, buf: array of byte, direction: int): string
 	ctr := array[Bsize] of {* => byte 0};
 	p64(ctr, off/big Sectorsize);
 	for(i := 0; i < n; i++) {
-		#say(sprint("crypt, sector %bd, ctr %s", (off/big Sectorsize)+big i, hex(ctr)));
+		if(dflag) say(sprint("crypt, sector %bd, ctr %s", (off/big Sectorsize)+big i, hex(ctr)));
 
 		# encrypt the sector number to get an ivec
 		xor := array[len ctr] of byte;
@@ -449,7 +499,7 @@ aligned(off: big, n: int): string
 
 dowrite(buf: array of byte, off: big): string
 {
-	say(sprint("write, off=%bd len=%d", off, len buf));
+	if(dflag) say(sprint("write, off=%bd len=%d", off, len buf));
 
 	err := aligned(off, len buf);
 	if(err != nil)
@@ -458,7 +508,10 @@ dowrite(buf: array of byte, off: big): string
 	if(off+big len buf > filesize)
 		return "write outside file boundaries";
 
-	err = crypt(off, buf, kr->Encrypt);
+	case config.alg {
+	Aaescbc =>	err = cryptcbc(off, buf, kr->Encrypt);
+	Aaesxts =>	err = cryptxts(off, buf, kr->Encrypt);
+	}
 	if(err != nil)
 		return err;
 	n := sys->pwrite(filefd, buf, len buf, off+big Hdrsize);
@@ -469,7 +522,7 @@ dowrite(buf: array of byte, off: big): string
 
 doread(n: int, off: big): (array of byte, string)
 {
-	say(sprint("read, off=%bd n=%d", off, n));
+	if(dflag) say(sprint("read, off=%bd n=%d", off, n));
 
 	err := aligned(off, n);
 	if(err != nil)
@@ -482,7 +535,10 @@ doread(n: int, off: big): (array of byte, string)
 	if(nn % Sectorsize != 0)
 		return (nil, "partial read misaligned");
 	buf = buf[:nn];
-	err = crypt(off, buf, kr->Decrypt);
+	case config.alg {
+	Aaescbc =>	err = cryptcbc(off, buf, kr->Decrypt);
+	Aaesxts =>	err = cryptxts(off, buf, kr->Decrypt);
+	}
 	return (buf, err);
 }
 
@@ -505,11 +561,22 @@ dostyx(gm: ref Tmsg)
 		case q {
 		Qctl =>
 			s := string m.data;
-			if(s == "forget" || s == "forget\n") {
+			if(s != nil && s[len s-1] == '\n')
+				s = s[:len s-1];
+			case s {
+			"forget" =>
 				keystate = nil;
-				srv.reply(ref Rmsg.Write(m.tag, len m.data));
-			} else
-				replyerror(m, "bad ctl");
+				keystatex = nil;
+			"debug" =>
+				dflag = Dflag = 1;
+				styxservers->traceset(Dflag);
+			"nodebug" =>
+				dflag = Dflag = 0;
+				styxservers->traceset(Dflag);
+			* =>
+				return replyerror(m, "bad ctl");
+			}
+			srv.reply(ref Rmsg.Write(m.tag, len m.data));
 				
 		Qdata =>
 			werr := dowrite(m.data, m.offset);
@@ -669,6 +736,20 @@ eq(a, b: array of byte): int
 		if(a[i] != b[i])
 			return 0;
 	return 1;
+}
+
+p64le(d: array of byte, v: big)
+{
+	d = d[len d-8:];
+	o := 8;
+	d[--o] = byte (v>>56);
+	d[--o] = byte (v>>48);
+	d[--o] = byte (v>>40);
+	d[--o] = byte (v>>32);
+	d[--o] = byte (v>>24);
+	d[--o] = byte (v>>16);
+	d[--o] = byte (v>>8);
+	d[--o] = byte (v>>0);
 }
 
 p64(d: array of byte, v: big)
