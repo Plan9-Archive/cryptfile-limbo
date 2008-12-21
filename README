@@ -1,6 +1,37 @@
-# warning
+# status
 
-do not use!  there is no real encryption yet.  so for now, there is only work on the programming side of things.
+usable.  haven't done performance tests.  really could use the
+opinion on the crypto from someone with more experience in this
+area.
 
-# todo
-- make flushing wstat (all don't-cares) do the same on the underlying fd.
+
+# intro
+
+this is cryptfile, an encrypted block file served over styx.
+for more information, see the manual page, cryptfile(4).
+
+
+# download
+
+see http://www.ueber.net/code/r/cryptfile for instructions.
+
+
+# install
+
+first, ensure a "mkconfig" file is present.  a bind/symlink to the
+mkconfig of your inferno install should do.  now "mk" to compile
+and "mk install" to install the files.
+
+
+# licence & author
+
+this code is in the public domain, written by mechiel lukkien,
+reachable at mechiel@ueber.net or mechiel@xs4all.nl.
+
+
+# todo:
+
+- after a "forget" the user enters a password.  if it is wrong, the
+  styx read/write on the file fails.  this might upset file servers
+  such as kfs much.  perhaps it is better not to respond to the styx
+  request until the user enters a correct password.
