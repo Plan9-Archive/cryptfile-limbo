@@ -1,8 +1,8 @@
 # status
 
-usable.  haven't done performance tests.  really could use the
-opinion on the crypto from someone with more experience in this
-area.
+needs testing.  really could use the opinion on the crypto from
+someone with more experience in this area.  haven't done performance
+tests.
 
 
 # intro
@@ -35,3 +35,7 @@ reachable at mechiel@ueber.net or mechiel@xs4all.nl.
   styx read/write on the file fails.  this might upset file servers
   such as kfs much.  perhaps it is better not to respond to the styx
   request until the user enters a correct password.
+- add option to change the password (but keep the key of course).
+  involves making a new salt, deriving a new key, making a new iv and
+  making a new crypted data (with new random cookie, the same key and
+  the calculated sha1).
