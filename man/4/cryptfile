@@ -4,6 +4,7 @@
 cryptfile \- encrypted block file
 
 .SH SYNOPSIS
+mount {
 .B cryptfile
 [
 .B -Ddi
@@ -18,6 +19,7 @@ cryptfile \- encrypted block file
 .I keybits
 ]
 .I file
+} mtpt
 
 .SH DESCRIPTION
 .B Cryptfile
@@ -118,12 +120,12 @@ Enable/disable styx trace printing, and debug message printing.
 .SH EXAMPLE
 The initialize an encrypted file and start a fresh kfs on it:
 .EX
-	mount -A {cryptfile -i -m aes-xts -l 128 $home/encrypted} /n/decrypted/
-	mount -A {disk/kfs -r /n/decrypted/data} /n/kfs
+	mount {cryptfile -i -m aes-xts -l 128 $home/encrypted} /n/decrypted/
+	mount {disk/kfs -r /n/decrypted/data} /n/kfs
 .EE
 And to mount a previously initialized encrypted file:
 .EX
-	mount -A {cryptfile $home/encrypted} /n/decrypted/
+	mount {cryptfile $home/encrypted} /n/decrypted/
 .EE
 
 .SH SOURCE

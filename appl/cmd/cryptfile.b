@@ -261,7 +261,7 @@ verifysig(c: ref Cfg, buf: array of byte): string
 	dg := kr->sha1(buf, len buf-kr->SHA1dlen, nil, nil);
 	kr->sha1(cfgbuf, len cfgbuf, sig, dg);
 	if(!eq(buf[len buf-kr->SHA1dlen:], sig))
-		return "bad signature";
+		return "bad password";
 	return nil;
 }
 
