@@ -18,15 +18,17 @@ see http://www.ueber.net/code/r/cryptfile for instructions.
 
 # install
 
-first, ensure a "mkconfig" file is present.  a bind/symlink to the
-mkconfig of your inferno install should do.  now "mk" to compile
-and "mk install" to install the files.
+change the "mkconfig" if you don't have $ROOT set.  now "mk" to
+compile and "mk install" to install the files.
+
+when building from within inferno, insert SYSHOST=Inferno and ROOT=
+in the mk invocations to override the values in the mkconfig.
 
 
 # licence & author
 
 this code is in the public domain, written by mechiel lukkien,
-reachable at mechiel@ueber.net or mechiel@xs4all.nl.
+reachable at mechiel@ueber.net.
 
 
 # todo:

@@ -1,6 +1,7 @@
 # see rfc2898
 
-Pbkdf2: module {
+Pbkdf2: module
+{
 	PATH:	con "/dis/lib/pbkdf2.dis";
 
 	init:		fn();
